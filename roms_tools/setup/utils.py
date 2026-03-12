@@ -776,15 +776,20 @@ def group_dataset(ds, filepath):
         if len(ds["abs_time"]) > 2:
             # Determine the frequency of the data
             abs_time_freq = pd.infer_freq(ds["abs_time"].to_index())
-            if abs_time_freq.lower() in [
+            if abs_time_freq is not None and abs_time_freq.lower() in [
                 "d",
                 "h",
                 "t",
                 "s",
             ]:  # Daily or higher frequency
                 dataset_list, output_filenames = group_by_month(ds, filepath)
-            else:
+            elif abs_time_freq is not None:
+                # Inferrable frequency but not daily or higher
                 dataset_list, output_filenames = group_by_year(ds, filepath)
+            else:
+                # Cannot infer frequency (e.g., gaps in time series from monthly processing)
+                # Default to grouping by month
+                dataset_list, output_filenames = group_by_month(ds, filepath)
         else:
             # Convert time index to datetime if not already
             abs_time_index = ds["abs_time"].to_index()
