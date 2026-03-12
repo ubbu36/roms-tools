@@ -2405,9 +2405,16 @@ def choose_subdomain(
     )
     lon = subdomain[dim_names["longitude"]]
 
+    # Determine if concatenation is needed and calculate wider longitude range for subsetting
+    # This allows us to subset longitude BEFORE concatenation, reducing memory usage
+    needs_concatenation = False
+    concat_end: TConcatEndTypes | None = None
+    lon_subset_min = None
+    lon_subset_max = None
+
     if is_global:
         concats = []
-        # Concatenate only if necessary
+        # Check if concatenation is necessary
         if lon_max + margin > lon.max():
             # See if shifting by +360 degrees helps
             if (lon_min - margin > (lon + 360).min()) and (
@@ -2428,12 +2435,23 @@ def choose_subdomain(
                 concats.append("lower")
 
         if concats:
-            end = "both" if len(concats) == 2 else concats[0]
-            end = cast(TConcatEndTypes, end)
-            subdomain = _concatenate_longitudes(
-                subdomain, dim_names=dim_names, end=end, use_dask=use_dask
-            )
-            lon = subdomain[dim_names["longitude"]]
+            needs_concatenation = True
+            concat_end = cast(TConcatEndTypes, "both" if len(concats) == 2 else concats[0])
+            
+            # Calculate wider longitude range needed for concatenation
+            # This allows us to subset BEFORE concatenating, reducing memory
+            if concat_end == "upper":
+                # Need from lon_min-margin to lon.max() (full upper range)
+                lon_subset_min = lon_min - margin
+                lon_subset_max = lon.max().values
+            elif concat_end == "lower":
+                # Need from lon.min() to lon_max+margin (full lower range)
+                lon_subset_min = lon.min().values
+                lon_subset_max = lon_max + margin
+            else:  # "both"
+                # Need full range for both concatenation
+                lon_subset_min = lon.min().values
+                lon_subset_max = lon.max().values
 
     else:
         # Adjust longitude range if needed to match the expected range
@@ -2457,12 +2475,35 @@ def choose_subdomain(
                     lon_min += 360
                     lon_max += 360
 
-    # Select the subdomain in longitude direction
-    subdomain = subdomain.sel(
-        **{
-            dim_names["longitude"]: slice(lon_min - margin, lon_max + margin),
-        }
-    )
+    # Subset longitude BEFORE concatenation to reduce memory usage
+    if needs_concatenation and lon_subset_min is not None and lon_subset_max is not None:
+        # Subset to wider range that covers concatenation needs
+        subdomain = subdomain.sel(
+            **{
+                dim_names["longitude"]: slice(lon_subset_min, lon_subset_max),
+            }
+        )
+        lon = subdomain[dim_names["longitude"]]
+        
+        # Now concatenate only the subset (much smaller!)
+        subdomain = _concatenate_longitudes(
+            subdomain, dim_names=dim_names, end=concat_end, use_dask=use_dask
+        )
+        lon = subdomain[dim_names["longitude"]]
+        
+        # Final subset to exact range needed
+        subdomain = subdomain.sel(
+            **{
+                dim_names["longitude"]: slice(lon_min - margin, lon_max + margin),
+            }
+        )
+    else:
+        # No concatenation needed, just subset to final range
+        subdomain = subdomain.sel(
+            **{
+                dim_names["longitude"]: slice(lon_min - margin, lon_max + margin),
+            }
+        )
     # Check if the selected subdomain has zero dimensions in latitude or longitude
     if (
         dim_names["latitude"] not in subdomain
