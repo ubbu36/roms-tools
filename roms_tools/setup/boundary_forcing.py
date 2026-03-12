@@ -186,11 +186,12 @@ class BoundaryForcing:
                 monthly_ds = self._process_time_range(month_start, month_end, target_coords)
                 monthly_datasets.append(monthly_ds)
             
-            # Concatenate all monthly datasets
+            # Concatenate all monthly datasets along the time dimension
+            # (will be renamed to bry_time in _add_global_metadata)
             if monthly_datasets:
-                ds = xr.concat(monthly_datasets, dim="bry_time")
+                ds = xr.concat(monthly_datasets, dim="time")
                 # Sort by time to ensure correct ordering
-                ds = ds.sortby("bry_time")
+                ds = ds.sortby("time")
             else:
                 ds = xr.Dataset()
         else:
