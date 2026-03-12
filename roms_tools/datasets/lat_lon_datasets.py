@@ -2397,10 +2397,29 @@ def choose_subdomain(
 
     margin = resolution * buffer_points
 
-    # Select the subdomain in latitude direction (so that we have to concatenate fewer latitudes below if concatenation is necessary)
-    subdomain = ds.sel(
+    # Optimize: Load only coordinate arrays first (they're small) and compute indices
+    # This is much faster than coordinate-based selection on large datasets
+    lat_coord = ds[dim_names["latitude"]]
+    lon_coord = ds[dim_names["longitude"]]
+    
+    # Load coordinates if they're dask arrays (needed for searchsorted)
+    try:
+        import dask.array as da
+        if use_dask and isinstance(lat_coord.data, da.Array):
+            lat_coord = lat_coord.load()
+            lon_coord = lon_coord.load()
+    except ImportError:
+        pass
+    
+    # Find latitude indices using binary search (much faster than sel)
+    lat_values = lat_coord.values
+    lat_idx_min = max(0, np.searchsorted(lat_values, lat_min - margin, side="left"))
+    lat_idx_max = min(len(lat_values), np.searchsorted(lat_values, lat_max + margin, side="right"))
+    
+    # Use isel for latitude subsetting (index-based, much faster)
+    subdomain = ds.isel(
         **{
-            dim_names["latitude"]: slice(lat_min - margin, lat_max + margin),
+            dim_names["latitude"]: slice(lat_idx_min, lat_idx_max),
         }
     )
     lon = subdomain[dim_names["longitude"]]
@@ -2477,10 +2496,22 @@ def choose_subdomain(
 
     # Subset longitude BEFORE concatenation to reduce memory usage
     if needs_concatenation and lon_subset_min is not None and lon_subset_max is not None:
-        # Subset to wider range that covers concatenation needs
-        subdomain = subdomain.sel(
+        # Compute longitude indices for the wider range
+        lon_values = lon.values
+        # Load if dask array
+        try:
+            import dask.array as da
+            if use_dask and isinstance(lon_values, da.Array):
+                lon_values = lon_values.compute()
+        except ImportError:
+            pass
+        lon_idx_min = max(0, np.searchsorted(lon_values, lon_subset_min, side="left"))
+        lon_idx_max = min(len(lon_values), np.searchsorted(lon_values, lon_subset_max, side="right"))
+        
+        # Subset to wider range that covers concatenation needs using isel
+        subdomain = subdomain.isel(
             **{
-                dim_names["longitude"]: slice(lon_subset_min, lon_subset_max),
+                dim_names["longitude"]: slice(lon_idx_min, lon_idx_max),
             }
         )
         lon = subdomain[dim_names["longitude"]]
@@ -2491,17 +2522,37 @@ def choose_subdomain(
         )
         lon = subdomain[dim_names["longitude"]]
         
-        # Final subset to exact range needed
-        subdomain = subdomain.sel(
+        # Final subset to exact range needed using isel
+        lon_values = lon.values
+        # Load if dask array
+        try:
+            import dask.array as da
+            if use_dask and isinstance(lon_values, da.Array):
+                lon_values = lon_values.compute()
+        except ImportError:
+            pass
+        lon_idx_min = max(0, np.searchsorted(lon_values, lon_min - margin, side="left"))
+        lon_idx_max = min(len(lon_values), np.searchsorted(lon_values, lon_max + margin, side="right"))
+        subdomain = subdomain.isel(
             **{
-                dim_names["longitude"]: slice(lon_min - margin, lon_max + margin),
+                dim_names["longitude"]: slice(lon_idx_min, lon_idx_max),
             }
         )
     else:
-        # No concatenation needed, just subset to final range
-        subdomain = subdomain.sel(
+        # No concatenation needed, compute indices and use isel for final range
+        lon_values = lon.values
+        # Load if dask array
+        try:
+            import dask.array as da
+            if use_dask and isinstance(lon_values, da.Array):
+                lon_values = lon_values.compute()
+        except ImportError:
+            pass
+        lon_idx_min = max(0, np.searchsorted(lon_values, lon_min - margin, side="left"))
+        lon_idx_max = min(len(lon_values), np.searchsorted(lon_values, lon_max + margin, side="right"))
+        subdomain = subdomain.isel(
             **{
-                dim_names["longitude"]: slice(lon_min - margin, lon_max + margin),
+                dim_names["longitude"]: slice(lon_idx_min, lon_idx_max),
             }
         )
     # Check if the selected subdomain has zero dimensions in latitude or longitude
