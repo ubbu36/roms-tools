@@ -161,18 +161,31 @@ class BoundaryForcing:
         )
 
         if process_monthly:
-            # Process month by month
+            # Process month by month: subset spatially first (lazy), then load month by month
             monthly_ranges = _generate_monthly_ranges(self.start_time, self.end_time)
             monthly_datasets = []
             
-            # Get a sample data object to set up variable_info and boundary_info
-            # We only need it for its var_names attribute, so use a minimal time range
-            sample_data = self._get_data_for_time_range(
-                self.start_time, 
-                min(self.end_time, datetime(self.start_time.year, self.start_time.month, 28))
-            )
-            self._set_variable_info(sample_data)
+            # Load full dataset once (lazy with dask) and subset spatially
+            logging.info("Loading full dataset and subsetting spatially (lazy operation)...")
+            full_data = self._get_data()
+            
+            # Get a sample to set up variable_info and boundary_info
+            self._set_variable_info(full_data)
             self._set_boundary_info()
+            
+            # Subset spatially (still lazy - doesn't load data into memory)
+            # For monthly processing, we always subset to the full target domain first
+            # to reduce the spatial extent before loading time slices
+            if self.apply_2d_horizontal_fill:
+                full_data.choose_subdomain(target_coords)
+                full_data.post_process()
+                full_data.convert_to_float64()
+                full_data.extrapolate_deepest_to_bottom()
+                full_data.apply_lateral_fill()
+            else:
+                # Even without 2D fill, subset to target domain to reduce spatial extent
+                # This makes the per-boundary subsetting faster
+                full_data.choose_subdomain(target_coords)
             
             logging.info(f"Processing {len(monthly_ranges)} month(s) separately to reduce memory usage")
             
@@ -183,7 +196,11 @@ class BoundaryForcing:
                 )
                 # Reset depth coordinates for each month (they're computed per month)
                 self.ds_depth_coords = xr.Dataset()
-                monthly_ds = self._process_time_range(month_start, month_end, target_coords)
+                
+                # Select time slice from already-subsetted data and load it
+                monthly_ds = self._process_time_slice_from_subsetted_data(
+                    month_start, month_end, target_coords, full_data
+                )
                 monthly_datasets.append(monthly_ds)
             
             # Concatenate all monthly datasets along the time dimension
@@ -194,6 +211,8 @@ class BoundaryForcing:
                 ds = ds.sortby("time")
             else:
                 ds = xr.Dataset()
+            
+            sample_data = full_data
         else:
             # Process all at once (original behavior)
             data = self._get_data()
@@ -431,12 +450,69 @@ class BoundaryForcing:
             apply_post_processing=False,  # Delay post-processing until after subsetting
         )
 
+    def _process_time_slice_from_subsetted_data(
+        self,
+        start_time: datetime,
+        end_time: datetime,
+        target_coords: dict,
+        subsetted_data: GLORYSDataset | GLORYSDefaultDataset | CESMBGCDataset | UnifiedBGCDataset,
+    ) -> xr.Dataset:
+        """Process a time slice from an already spatially-subsetted dataset.
+        
+        This method selects a time range from the subsetted dataset, loads it into memory,
+        and processes it for boundary forcing.
+        
+        Parameters
+        ----------
+        start_time : datetime
+            Start time for the time slice.
+        end_time : datetime
+            End time for the time slice.
+        target_coords : dict
+            Target coordinates dictionary.
+        subsetted_data : Dataset
+            Already spatially-subsetted dataset (from choose_subdomain).
+        
+        Returns
+        -------
+        xr.Dataset
+            Processed boundary forcing dataset for the time slice.
+        """
+        # Create a copy of the dataset and select the time slice
+        time_dim = subsetted_data.dim_names["time"]
+        time_coord = subsetted_data.ds[time_dim]
+        
+        # Select time slice (still lazy)
+        time_mask = (time_coord >= np.datetime64(start_time)) & (time_coord <= np.datetime64(end_time))
+        time_slice = time_coord.where(time_mask, drop=True)
+        
+        # Create a temporary dataset with just this time slice
+        data_slice = subsetted_data.ds.sel({time_dim: time_slice})
+        
+        # Load the time slice into memory
+        if self.use_dask:
+            from dask.diagnostics import ProgressBar
+            with ProgressBar():
+                data_slice = data_slice.load()
+        else:
+            data_slice = data_slice.load()
+        
+        # Create a temporary dataset object for this time slice
+        # We need to create a copy of the dataset class with the sliced data
+        temp_data = type(subsetted_data).from_ds(subsetted_data, data_slice)
+        
+        # Now process this time slice (same as _process_time_range but with pre-subsetted data)
+        return self._process_time_range(
+            start_time, end_time, target_coords, data=temp_data, already_subsetted=True
+        )
+
     def _process_time_range(
         self,
         start_time: datetime | None,
         end_time: datetime | None,
         target_coords: dict,
         data: GLORYSDataset | GLORYSDefaultDataset | CESMBGCDataset | UnifiedBGCDataset | None = None,
+        already_subsetted: bool = False,
     ) -> xr.Dataset:
         """Process a time range and return the boundary forcing dataset.
         
@@ -450,6 +526,9 @@ class BoundaryForcing:
             Target coordinates dictionary.
         data : Dataset | None, optional
             Pre-loaded dataset. If None, will be loaded.
+        already_subsetted : bool, optional
+            If True, the data has already been spatially subsetted and post-processed.
+            Default is False.
         
         Returns
         -------
@@ -460,16 +539,17 @@ class BoundaryForcing:
         if data is None:
             data = self._get_data_for_time_range(start_time, end_time)
 
-        if self.apply_2d_horizontal_fill:
-            data.choose_subdomain(
-                target_coords,
-            )
-            # Apply post-processing after subsetting to avoid computations on full dataset
-            data.post_process()
-            # Enforce double precision to ensure reproducibility
-            data.convert_to_float64()
-            data.extrapolate_deepest_to_bottom()
-            data.apply_lateral_fill()
+        if not already_subsetted:
+            if self.apply_2d_horizontal_fill:
+                data.choose_subdomain(
+                    target_coords,
+                )
+                # Apply post-processing after subsetting to avoid computations on full dataset
+                data.post_process()
+                # Enforce double precision to ensure reproducibility
+                data.convert_to_float64()
+                data.extrapolate_deepest_to_bottom()
+                data.apply_lateral_fill()
 
         ds = xr.Dataset()
 
@@ -511,12 +591,15 @@ class BoundaryForcing:
                     return_copy=True,
                 )
 
-                if not self.apply_2d_horizontal_fill:
+                if not self.apply_2d_horizontal_fill and not already_subsetted:
                     # Apply post-processing after subsetting to avoid computations on full dataset
                     bdry_data.post_process()
                     # Enforce double precision to ensure reproducibility
                     bdry_data.convert_to_float64()
                     bdry_data.extrapolate_deepest_to_bottom()
+                elif not self.apply_2d_horizontal_fill and already_subsetted:
+                    # Data already post-processed, just ensure float64
+                    bdry_data.convert_to_float64()
 
                 processed_fields = {}
 
