@@ -150,31 +150,17 @@ class BoundaryForcing:
 
         data = self._get_data()
 
-        # Set boundary info early so we can calculate bounding box
-        self._set_boundary_info()
-
-        # Calculate bounding box covering all enabled boundaries and subset data early
-        # This reduces memory usage by working with a smaller dataset from the start
-        # When apply_2d_horizontal_fill=True, use full grid; otherwise use bounding box
         if self.apply_2d_horizontal_fill:
-            # Use full grid coordinates for 2D fill
-            subset_coords = target_coords
-        else:
-            # Use bounding box for early subsetting to reduce memory
-            subset_coords = self._calculate_boundary_bounding_box(target_coords)
-        
-        data.choose_subdomain(
-            subset_coords,
-            buffer_points=3,  # Use same buffer as per-boundary subsetting
-        )
-
-        if self.apply_2d_horizontal_fill:
+            data.choose_subdomain(
+                target_coords,
+            )
             # Enforce double precision to ensure reproducibility
             data.convert_to_float64()
             data.extrapolate_deepest_to_bottom()
             data.apply_lateral_fill()
 
         self._set_variable_info(data)
+        self._set_boundary_info()
         ds = xr.Dataset()
 
         var_names = {
@@ -663,66 +649,6 @@ class BoundaryForcing:
         bdry_coords = get_boundary_coords()
 
         self.bdry_coords = bdry_coords
-
-    def _calculate_boundary_bounding_box(self, target_coords):
-        """Calculate bounding box coordinates that cover all enabled boundaries.
-
-        This method computes the minimum and maximum latitude and longitude values
-        across all enabled boundaries, creating a bounding box that encompasses all
-        boundary regions. This is used to subset the source data early, reducing
-        memory usage.
-
-        Parameters
-        ----------
-        target_coords : dict
-            Dictionary containing target grid coordinates with keys "lat", "lon", "straddle".
-
-        Returns
-        -------
-        dict
-            Dictionary with keys "lat", "lon", "straddle" containing the bounding box
-            coordinates covering all enabled boundaries.
-        """
-        # Collect all boundary coordinates for enabled boundaries
-        all_lats = []
-        all_lons = []
-
-        for direction, is_enabled in self.boundaries.items():
-            if is_enabled:
-                # Get boundary coordinates for this direction
-                # Use vector coordinates as they cover the widest area
-                bdry_lat = target_coords["lat"].isel(
-                    **self.bdry_coords["vector"][direction]
-                )
-                bdry_lon = target_coords["lon"].isel(
-                    **self.bdry_coords["vector"][direction]
-                )
-                all_lats.append(bdry_lat)
-                all_lons.append(bdry_lon)
-
-        if not all_lats:
-            # No boundaries enabled, use full grid
-            return target_coords
-
-        # Concatenate all boundary coordinates
-        combined_lat = xr.concat(all_lats, dim="boundary_points")
-        combined_lon = xr.concat(all_lons, dim="boundary_points")
-
-        # Calculate bounding box
-        bbox_lat = xr.DataArray(
-            [combined_lat.min().values, combined_lat.max().values],
-            dims="bbox",
-        )
-        bbox_lon = xr.DataArray(
-            [combined_lon.min().values, combined_lon.max().values],
-            dims="bbox",
-        )
-
-        return {
-            "lat": bbox_lat,
-            "lon": bbox_lon,
-            "straddle": target_coords["straddle"],
-        }
 
     def _get_depth_coordinates(
         self,
