@@ -154,6 +154,8 @@ class BoundaryForcing:
             data.choose_subdomain(
                 target_coords,
             )
+            # Apply post-processing after subsetting to avoid computations on full dataset
+            data.post_process()
             # Enforce double precision to ensure reproducibility
             data.convert_to_float64()
             data.extrapolate_deepest_to_bottom()
@@ -202,6 +204,8 @@ class BoundaryForcing:
                 )
 
                 if not self.apply_2d_horizontal_fill:
+                    # Apply post-processing after subsetting to avoid computations on full dataset
+                    bdry_data.post_process()
                     # Enforce double precision to ensure reproducibility
                     bdry_data.convert_to_float64()
                     bdry_data.extrapolate_deepest_to_bottom()
@@ -501,6 +505,7 @@ class BoundaryForcing:
             end_time=self.end_time,
             climatology=self.source["climatology"],  # type: ignore[arg-type]
             use_dask=self.use_dask,
+            apply_post_processing=False,  # Delay post-processing until after subsetting
         )
 
     def _set_variable_info(self, data):
