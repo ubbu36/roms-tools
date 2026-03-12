@@ -1,5 +1,6 @@
 import importlib.metadata
 import logging
+from calendar import monthrange
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -148,7 +149,315 @@ class BoundaryForcing:
 
         target_coords = get_target_coords(self.grid)
 
-        data = self._get_data()
+        # Determine if we should process month-by-month
+        process_monthly = (
+            self.start_time is not None
+            and self.end_time is not None
+            and not self.source.get("climatology", False)
+            and (
+                self.start_time.year != self.end_time.year
+                or self.start_time.month != self.end_time.month
+            )
+        )
+
+        if process_monthly:
+            # Process month by month
+            monthly_ranges = _generate_monthly_ranges(self.start_time, self.end_time)
+            monthly_datasets = []
+            
+            # Get a sample data object to set up variable_info and boundary_info
+            # We only need it for its var_names attribute, so use a minimal time range
+            sample_data = self._get_data_for_time_range(
+                self.start_time, 
+                min(self.end_time, datetime(self.start_time.year, self.start_time.month, 28))
+            )
+            self._set_variable_info(sample_data)
+            self._set_boundary_info()
+            
+            logging.info(f"Processing {len(monthly_ranges)} month(s) separately to reduce memory usage")
+            
+            for month_idx, (month_start, month_end) in enumerate(monthly_ranges):
+                logging.info(
+                    f"Processing month {month_idx + 1}/{len(monthly_ranges)}: "
+                    f"{month_start.strftime('%Y-%m')}"
+                )
+                # Reset depth coordinates for each month (they're computed per month)
+                self.ds_depth_coords = xr.Dataset()
+                monthly_ds = self._process_time_range(month_start, month_end, target_coords)
+                monthly_datasets.append(monthly_ds)
+            
+            # Concatenate all monthly datasets
+            if monthly_datasets:
+                ds = xr.concat(monthly_datasets, dim="bry_time")
+                # Sort by time to ensure correct ordering
+                ds = ds.sortby("bry_time")
+            else:
+                ds = xr.Dataset()
+        else:
+            # Process all at once (original behavior)
+            data = self._get_data()
+
+            if self.apply_2d_horizontal_fill:
+                data.choose_subdomain(
+                    target_coords,
+                )
+                # Apply post-processing after subsetting to avoid computations on full dataset
+                data.post_process()
+                # Enforce double precision to ensure reproducibility
+                data.convert_to_float64()
+                data.extrapolate_deepest_to_bottom()
+                data.apply_lateral_fill()
+
+            self._set_variable_info(data)
+            self._set_boundary_info()
+            ds = self._process_time_range(self.start_time, self.end_time, target_coords, data=data)
+            sample_data = data
+
+        # Add global information (use sample_data or data if available)
+        if process_monthly:
+            # For monthly processing, we need a data object for metadata
+            # Use the first month's data or create a minimal one
+            if monthly_datasets:
+                sample_data = self._get_data_for_time_range(
+                    monthly_ranges[0][0],
+                    monthly_ranges[0][1]
+                )
+            else:
+                sample_data = self._get_data_for_time_range(
+                    self.start_time,
+                    self.end_time
+                )
+        else:
+            sample_data = data
+        
+        ds = self._add_global_metadata(sample_data, ds)
+
+        if not self.bypass_validation:
+            self._validate(ds)
+
+        # substitute NaNs over land by a fill value to avoid blow-up of ROMS
+        for var_name in ds.data_vars:
+            ds[var_name] = substitute_nans_by_fillvalue(ds[var_name])
+
+        self.ds = ds
+
+    def _input_checks(self) -> None:
+        """Validate and normalize user-provided input parameters."""
+        # -------------------------------------------------------
+        # Time range checks
+        # -------------------------------------------------------
+        if (self.start_time is None) != (self.end_time is None):
+            raise ValueError(
+                "Both `start_time` and `end_time` must be provided together as datetime objects or both should be None."
+            )
+
+        if self.start_time is None and self.end_time is None:
+            logging.warning(
+                "Both `start_time` and `end_time` are None. No time filtering will be applied to the source data."
+            )
+
+        # -------------------------------------------------------
+        # Type check
+        # -------------------------------------------------------
+        if self.type not in {"physics", "bgc"}:
+            raise ValueError("`type` must be either 'physics' or 'bgc'.")
+
+        # -------------------------------------------------------
+        # Source configuration checks
+        # -------------------------------------------------------
+        if "name" not in self.source:
+            raise ValueError("`source` must include a 'name'.")
+
+        if "path" not in self.source:
+            if self.source["name"] != "GLORYS":
+                raise ValueError("`source` must include a 'path'.")
+            self.source["path"] = GLORYSDefaultDataset.dataset_name
+
+        # Assign default value
+        self.source["climatology"] = self.source.get("climatology", False)
+
+        # -------------------------------------------------------
+        # Boundary selection defaults and validation
+        # -------------------------------------------------------
+
+        self.boundaries = check_and_set_boundaries(
+            self.boundaries, self.grid.ds.mask_rho
+        )
+
+        # -------------------------------------------------------
+        # Depth adjustment checks
+        # -------------------------------------------------------
+        if self.type == "bgc" and self.adjust_depth_for_sea_surface_height:
+            logging.warning(
+                "adjust_depth_for_sea_surface_height is not applicable for BGC fields. "
+                "Setting it to False."
+            )
+            self.adjust_depth_for_sea_surface_height = False
+
+    def _get_data(
+        self,
+    ) -> GLORYSDataset | GLORYSDefaultDataset | CESMBGCDataset | UnifiedBGCDataset:
+        """Determine the correct `Dataset` type and return an instance.
+
+        Returns
+        -------
+        Dataset
+            The `Dataset` instance
+
+        """
+        dataset_map: dict[
+            str,
+            dict[
+                str,
+                dict[
+                    str,
+                    type[
+                        GLORYSDataset
+                        | GLORYSDefaultDataset
+                        | CESMBGCDataset
+                        | UnifiedBGCDataset
+                    ],
+                ],
+            ],
+        ] = {
+            "physics": {
+                "GLORYS": {
+                    "external": GLORYSDataset,
+                    "default": GLORYSDefaultDataset,
+                },
+            },
+            "bgc": {
+                "CESM_REGRIDDED": defaultdict(lambda: CESMBGCDataset),
+                "UNIFIED": defaultdict(lambda: UnifiedBGCDataset),
+            },
+        }
+
+        source_name = str(self.source["name"])
+        if source_name not in dataset_map[self.type]:
+            tpl = 'Valid options for source["name"] for type {} include: {}'
+            msg = tpl.format(self.type, " and ".join(dataset_map[self.type].keys()))
+            raise ValueError(msg)
+
+        has_no_path = "path" not in self.source
+        has_default_path = self.source.get("path") == GLORYSDefaultDataset.dataset_name
+        use_default = has_no_path or has_default_path
+
+        variant = "default" if use_default else "external"
+
+        data_type = dataset_map[self.type][source_name][variant]
+
+        if isinstance(self.source["path"], bool):
+            raise ValueError('source["path"] cannot be a boolean here')
+
+        return data_type(
+            filename=self.source["path"],
+            start_time=self.start_time,
+            end_time=self.end_time,
+            climatology=self.source["climatology"],  # type: ignore[arg-type]
+            use_dask=self.use_dask,
+            apply_post_processing=False,  # Delay post-processing until after subsetting
+        )
+
+    def _get_data_for_time_range(
+        self,
+        start_time: datetime | None,
+        end_time: datetime | None,
+    ) -> GLORYSDataset | GLORYSDefaultDataset | CESMBGCDataset | UnifiedBGCDataset:
+        """Get data for a specific time range. Used for month-by-month processing.
+        
+        Parameters
+        ----------
+        start_time : datetime | None
+            Start time for the data range.
+        end_time : datetime | None
+            End time for the data range.
+        
+        Returns
+        -------
+        Dataset
+            The Dataset instance for the specified time range.
+        """
+        dataset_map: dict[
+            str,
+            dict[
+                str,
+                dict[
+                    str,
+                    type[
+                        GLORYSDataset
+                        | GLORYSDefaultDataset
+                        | CESMBGCDataset
+                        | UnifiedBGCDataset
+                    ],
+                ],
+            ],
+        ] = {
+            "physics": {
+                "GLORYS": {
+                    "external": GLORYSDataset,
+                    "default": GLORYSDefaultDataset,
+                },
+            },
+            "bgc": {
+                "CESM_REGRIDDED": defaultdict(lambda: CESMBGCDataset),
+                "UNIFIED": defaultdict(lambda: UnifiedBGCDataset),
+            },
+        }
+
+        source_name = str(self.source["name"])
+        if source_name not in dataset_map[self.type]:
+            tpl = 'Valid options for source["name"] for type {} include: {}'
+            msg = tpl.format(self.type, " and ".join(dataset_map[self.type].keys()))
+            raise ValueError(msg)
+
+        has_no_path = "path" not in self.source
+        has_default_path = self.source.get("path") == GLORYSDefaultDataset.dataset_name
+        use_default = has_no_path or has_default_path
+
+        variant = "default" if use_default else "external"
+
+        data_type = dataset_map[self.type][source_name][variant]
+
+        if isinstance(self.source["path"], bool):
+            raise ValueError('source["path"] cannot be a boolean here')
+
+        return data_type(
+            filename=self.source["path"],
+            start_time=start_time,
+            end_time=end_time,
+            climatology=self.source["climatology"],  # type: ignore[arg-type]
+            use_dask=self.use_dask,
+            apply_post_processing=False,  # Delay post-processing until after subsetting
+        )
+
+    def _process_time_range(
+        self,
+        start_time: datetime | None,
+        end_time: datetime | None,
+        target_coords: dict,
+        data: GLORYSDataset | GLORYSDefaultDataset | CESMBGCDataset | UnifiedBGCDataset | None = None,
+    ) -> xr.Dataset:
+        """Process a time range and return the boundary forcing dataset.
+        
+        Parameters
+        ----------
+        start_time : datetime | None
+            Start time for processing.
+        end_time : datetime | None
+            End time for processing.
+        target_coords : dict
+            Target coordinates dictionary.
+        data : Dataset | None, optional
+            Pre-loaded dataset. If None, will be loaded.
+        
+        Returns
+        -------
+        xr.Dataset
+            Processed boundary forcing dataset for the time range.
+        """
+        # Load data if not provided
+        if data is None:
+            data = self._get_data_for_time_range(start_time, end_time)
 
         if self.apply_2d_horizontal_fill:
             data.choose_subdomain(
@@ -161,8 +470,6 @@ class BoundaryForcing:
             data.extrapolate_deepest_to_bottom()
             data.apply_lateral_fill()
 
-        self._set_variable_info(data)
-        self._set_boundary_info()
         ds = xr.Dataset()
 
         var_names = {
@@ -379,134 +686,7 @@ class BoundaryForcing:
                 # Write the boundary data into dataset
                 ds = self._write_into_dataset(direction, processed_fields, ds)
 
-        # Add global information
-        ds = self._add_global_metadata(data, ds)
-
-        if not self.bypass_validation:
-            self._validate(ds)
-
-        # substitute NaNs over land by a fill value to avoid blow-up of ROMS
-        for var_name in ds.data_vars:
-            ds[var_name] = substitute_nans_by_fillvalue(ds[var_name])
-
-        self.ds = ds
-
-    def _input_checks(self) -> None:
-        """Validate and normalize user-provided input parameters."""
-        # -------------------------------------------------------
-        # Time range checks
-        # -------------------------------------------------------
-        if (self.start_time is None) != (self.end_time is None):
-            raise ValueError(
-                "Both `start_time` and `end_time` must be provided together as datetime objects or both should be None."
-            )
-
-        if self.start_time is None and self.end_time is None:
-            logging.warning(
-                "Both `start_time` and `end_time` are None. No time filtering will be applied to the source data."
-            )
-
-        # -------------------------------------------------------
-        # Type check
-        # -------------------------------------------------------
-        if self.type not in {"physics", "bgc"}:
-            raise ValueError("`type` must be either 'physics' or 'bgc'.")
-
-        # -------------------------------------------------------
-        # Source configuration checks
-        # -------------------------------------------------------
-        if "name" not in self.source:
-            raise ValueError("`source` must include a 'name'.")
-
-        if "path" not in self.source:
-            if self.source["name"] != "GLORYS":
-                raise ValueError("`source` must include a 'path'.")
-            self.source["path"] = GLORYSDefaultDataset.dataset_name
-
-        # Assign default value
-        self.source["climatology"] = self.source.get("climatology", False)
-
-        # -------------------------------------------------------
-        # Boundary selection defaults and validation
-        # -------------------------------------------------------
-
-        self.boundaries = check_and_set_boundaries(
-            self.boundaries, self.grid.ds.mask_rho
-        )
-
-        # -------------------------------------------------------
-        # Depth adjustment checks
-        # -------------------------------------------------------
-        if self.type == "bgc" and self.adjust_depth_for_sea_surface_height:
-            logging.warning(
-                "adjust_depth_for_sea_surface_height is not applicable for BGC fields. "
-                "Setting it to False."
-            )
-            self.adjust_depth_for_sea_surface_height = False
-
-    def _get_data(
-        self,
-    ) -> GLORYSDataset | GLORYSDefaultDataset | CESMBGCDataset | UnifiedBGCDataset:
-        """Determine the correct `Dataset` type and return an instance.
-
-        Returns
-        -------
-        Dataset
-            The `Dataset` instance
-
-        """
-        dataset_map: dict[
-            str,
-            dict[
-                str,
-                dict[
-                    str,
-                    type[
-                        GLORYSDataset
-                        | GLORYSDefaultDataset
-                        | CESMBGCDataset
-                        | UnifiedBGCDataset
-                    ],
-                ],
-            ],
-        ] = {
-            "physics": {
-                "GLORYS": {
-                    "external": GLORYSDataset,
-                    "default": GLORYSDefaultDataset,
-                },
-            },
-            "bgc": {
-                "CESM_REGRIDDED": defaultdict(lambda: CESMBGCDataset),
-                "UNIFIED": defaultdict(lambda: UnifiedBGCDataset),
-            },
-        }
-
-        source_name = str(self.source["name"])
-        if source_name not in dataset_map[self.type]:
-            tpl = 'Valid options for source["name"] for type {} include: {}'
-            msg = tpl.format(self.type, " and ".join(dataset_map[self.type].keys()))
-            raise ValueError(msg)
-
-        has_no_path = "path" not in self.source
-        has_default_path = self.source.get("path") == GLORYSDefaultDataset.dataset_name
-        use_default = has_no_path or has_default_path
-
-        variant = "default" if use_default else "external"
-
-        data_type = dataset_map[self.type][source_name][variant]
-
-        if isinstance(self.source["path"], bool):
-            raise ValueError('source["path"] cannot be a boolean here')
-
-        return data_type(
-            filename=self.source["path"],
-            start_time=self.start_time,
-            end_time=self.end_time,
-            climatology=self.source["climatology"],  # type: ignore[arg-type]
-            use_dask=self.use_dask,
-            apply_post_processing=False,  # Delay post-processing until after subsetting
-        )
+        return ds
 
     def _set_variable_info(self, data):
         """Sets up a dictionary with metadata for variables based on the type of data
@@ -1109,6 +1289,48 @@ class BoundaryForcing:
 
         # Create and return an instance of InitialConditions
         return cls(grid=grid, **params, use_dask=use_dask)
+
+
+def _generate_monthly_ranges(
+    start_time: datetime, end_time: datetime
+) -> list[tuple[datetime, datetime]]:
+    """Generate monthly time ranges from start_time to end_time.
+    
+    Parameters
+    ----------
+    start_time : datetime
+        Start time of the range.
+    end_time : datetime
+        End time of the range.
+    
+    Returns
+    -------
+    list[tuple[datetime, datetime]]
+        List of (month_start, month_end) tuples covering the time range.
+    """
+    monthly_ranges = []
+    current = datetime(start_time.year, start_time.month, 1)
+    end = datetime(end_time.year, end_time.month, end_time.day, 
+                   end_time.hour, end_time.minute, end_time.second)
+    
+    while current <= end:
+        # Calculate the last day of the current month
+        _, last_day = monthrange(current.year, current.month)
+        month_end = datetime(current.year, current.month, last_day, 23, 59, 59)
+        
+        # Adjust start and end for the first and last months
+        month_start = max(current, start_time)
+        month_end = min(month_end, end)
+        
+        monthly_ranges.append((month_start, month_end))
+        
+        # Move to next month
+        if current.month == 12:
+            current = datetime(current.year + 1, 1, 1)
+        else:
+            current = datetime(current.year, current.month + 1, 1)
+    
+    return monthly_ranges
 
 
 def apply_1d_horizontal_fill(data_array: xr.DataArray) -> xr.DataArray:
